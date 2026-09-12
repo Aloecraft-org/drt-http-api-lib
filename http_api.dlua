@@ -1,0 +1,284 @@
+-- http_api -- the wire: request parsing, the one response envelope, and the
+-- edge's observation of the caller.
+--
+-- Extracted from discofetch api/supervisor.lua: the "helpers" banner and the
+-- request table built at the top of serve_forever. The arithmetic, the branch
+-- order and the refusal behaviour are unchanged. What reached `queue` and
+-- `json` as globals there arrives here through new(), so two instances over
+-- two queues can coexist and neither one reads a global.
+--
+-- ====================================================== the surface block
+--
+-- 1. Entry points.
+--
+--    Pure -- no host, no queue, no clock -- so no constructor:
+--
+--      M.split_query(target)      -> path, query
+--      M.request_from(msg)        -> the normalised request table
+--      M.int_param(v)             -> a whole number, or nil
+--      M.observed_address(req)    -> the caller's address as the edge saw it
+--      M.observed_port(req)       -> the source port the edge terminated
+--      M.public_forwarded(chain)  -> the relay chain minus our own topology
+--
+--    Bound -- these reach the response queue, so they come from new():
+--
+--      M.new{ out_queue = <handle>, push = <fn (queue, message)>,
+--             json = <table with encode> } -> instance
+--      instance:reply(conn, status, payload, headers, content_type)
+--      instance:fail(conn, status, code, message, headers)
+--      instance:no_body(conn, status)
+--
+--    The queue push is INJECTED rather than called: a module that reaches
+--    for a global queue cannot be handed a second one, and the test below
+--    is a table that records what it was pushed.
+--
+--    no_body exists so that this library is the ONLY writer of the response
+--    queue. Its one caller is the 204 path, where a real DELETE answers no
+--    body and json-encoding a nil would send the four bytes "null" under a
+--    status that promises nothing. That call site pushed its own message
+--    before extraction; two writers on one queue is how a library comes to
+--    assume an ordering it does not have.
+--
+-- 2. Configurable values.
+
+local M = {}
+
+-- The 401 header, frozen: every 401 the API answers is an auth challenge, so
+-- the header rides with the envelope rather than being spelled at each
+-- identity call site. `www-authenticate` must be on the deployment's
+-- response_headers allowlist or this is silently nothing (see below).
+M.AUTH_CHALLENGE = { ['www-authenticate'] = 'Bearer realm="discofetch"' }
+
+-- JSON unless a caller says otherwise, and in discofetch exactly one does:
+-- reflect's text mode, which exists to be piped into a shell variable. The
+-- listener owns this header, so it is a FIELD on the message rather than a
+-- name on the response_headers allowlist -- that list refuses content-type
+-- by name, along with the other framing headers.
+M.DEFAULT_CONTENT_TYPE = 'application/json'
+
+-- THE ALLOWLIST OBLIGATION, which is not a value this library can hold. A
+-- `headers` name that is not on the deployment's response_headers allowlist
+-- is dropped whole by the host, silently -- no error, no partial header, the
+-- response simply goes out without it. The allowlist lives in the host files
+-- and there are TWO of them (api/api.host.lua and api/api.dev.host.lua); a
+-- name added to one is a header that works in dev and vanishes in
+-- production. This module does not filter, because the host already does;
+-- what it can do is say so where someone adding a header will read it.
+
+-- 3. Fan-out points.
+--
+-- (a) The pure half of the surface. Bodies are in the depth sections below;
+--     a Lua local must precede its use, so the names are declared here and
+--     the wrappers bind them. A new pure export is a line in this block, not
+--     a function that appears somewhere further down.
+local split_query, request_from, int_param
+local observed_address, observed_port, public_forwarded
+
+M.split_query      = function (target) return split_query(target) end
+M.request_from     = function (msg)    return request_from(msg) end
+M.int_param        = function (v)      return int_param(v) end
+M.observed_address = function (req)    return observed_address(req) end
+M.observed_port    = function (req)    return observed_port(req) end
+M.public_forwarded = function (chain)  return public_forwarded(chain) end
+
+-- (b) Everything a constructed instance answers to. new() binds exactly this
+--     table, so a fourth method is a line here.
+local reply, fail, no_body
+
+local METHODS = {
+  reply   = function (self, conn, status, payload, headers, content_type)
+              return reply(self, conn, status, payload, headers, content_type)
+            end,
+  fail    = function (self, conn, status, code, message, headers)
+              return fail(self, conn, status, code, message, headers)
+            end,
+  no_body = function (self, conn, status) return no_body(self, conn, status) end,
+}
+
+-- ====================================================== end of the surface
+
+-- depth: construction. Every dep is named in its own sentence, so a missing
+-- or wrong-typed one is a failure at new() rather than a nil call on the
+-- serving path an hour later.
+function M.new(deps)
+  deps = deps or {}
+  assert(deps.out_queue ~= nil,
+    'http_api.new: deps.out_queue must be the response queue handle (http_out) from queue.declare')
+  assert(type(deps.push) == 'function',
+    'http_api.new: deps.push must be a function push(queue, message) -- queue.push, injected')
+  assert(type(deps.json) == 'table' and type(deps.json.encode) == 'function',
+    'http_api.new: deps.json must be a table with an encode function')
+  return setmetatable({
+    out_queue = deps.out_queue,
+    push      = deps.push,
+    json      = deps.json,
+  }, { __index = METHODS })
+end
+
+-- depth: the one response envelope, so a client never has to branch on shape.
+--
+-- A STRING payload is passed through verbatim. That exists for exactly one
+-- reason: json.encode cannot express an empty ARRAY. The encoder decides a
+-- table's shape from its keys, an empty table has none, so it emits `{}` --
+-- and there is no json.as_array to say otherwise (msgpack has one, json does
+-- not). A client that checks .length on `{}` breaks, so an empty list is
+-- spelled out as text rather than guessed at. Do not "improve" this into an
+-- always-encode: the string branch is the feature.
+function reply(self, conn, status, payload, headers, content_type)
+  self.push(self.out_queue, {
+    conn = conn,
+    status = status,
+    body = type(payload) == 'string' and payload or self.json.encode(payload),
+    content_type = content_type or M.DEFAULT_CONTENT_TYPE,
+    headers = headers,
+  })
+end
+
+-- depth: every refusal, in the same envelope. The code is for a program, the
+-- message is for a person, and headers is how a 401 carries its challenge and
+-- a 429 its retry-after -- both of which must be on the allowlist above.
+function fail(self, conn, status, code, message, headers)
+  reply(self, conn, status, { error = { code = code, message = message } }, headers)
+end
+
+-- depth: the no-body answer. Deliberately NOT reply(conn, status, ''): this
+-- message carries no content_type either, which is what 204 means on the
+-- wire. Same shape the dispatcher pushed by hand before extraction.
+function no_body(self, conn, status)
+  self.push(self.out_queue, { conn = conn, status = status, body = '' })
+end
+
+-- depth: the target split. The listener hands the request target over
+-- verbatim, query string and all -- it does not interpret paths, which is the
+-- right layering and means the split happens here.
+function split_query(target)
+  local path, qs = target:match('^([^?]*)%??(.*)$')
+  local query = {}
+  if qs and qs ~= '' then
+    for pair in qs:gmatch('[^&]+') do
+      local k, v = pair:match('^([^=]*)=?(.*)$')
+      if k and k ~= '' then
+        -- percent-decoding, enough for the shapes we care about (`q=a%20b`)
+        v = v:gsub('+', ' '):gsub('%%(%x%x)', function(h)
+          return string.char(tonumber(h, 16))
+        end)
+        query[k] = v
+      end
+    end
+  end
+  return path, query
+end
+
+-- depth: the normalised request table. Every field the handlers read is
+-- decided HERE, so no comparison below has to remember what a header was
+-- called or what case it arrived in.
+function request_from(m)
+  local path, query = split_query(m.path or '/')
+  local h = m.headers
+  return {
+    method = m.method,
+    path = path,
+    query = query,
+    -- The UNPARSED target, for the one consumer that must not lose the query
+    -- string: a redirecting rendezvous forwards path and query verbatim, so
+    -- label.<zone>/api?x=1 lands on /api?x=1.
+    target = m.path,
+    body = m.body,
+    -- `headers` is always present when the deployment allowlists anything --
+    -- possibly empty, but present -- so the shape here is decided by the host
+    -- file rather than by what a given request happened to carry. Names are
+    -- indexed lowercase because that is how the host delivers them.
+    authorization = h and h.authorization or nil,
+    sub = h and h['x-df-sub'] or nil,
+    act_as = h and h['act-as'] or nil,
+    -- Lowercased and stripped of any port, because a Host is not
+    -- case-sensitive and "example.com" and "example.com:8080" address the
+    -- same thing.
+    host = (h and h.host or ''):lower():match('^([^:]*)') or '',
+    -- The edge's observation (x-real-ip, one writer we own -- the edge SETS
+    -- it) and the informational relay chain.
+    real_ip = h and h['x-real-ip'] or nil,
+    forwarded = h and h['x-forwarded-for'] or nil,
+    -- The NAT-observation pair: the source port the edge terminated, and
+    -- WHICH edge -- constant while there is one edge, load-bearing the day a
+    -- second exists, because NAT mappings are per-destination and a caller on
+    -- a two-IP name must know which vantage answered. Deliberately not
+    -- x-df-*: that namespace is the stripped identity boundary, and these
+    -- must survive the trip. real_port arrives as TEXT and stays text here;
+    -- observed_port is what turns it into a number it is willing to publish.
+    real_port = h and h['x-real-port'] or nil,
+    edge = h and h['x-edge'] or nil,
+  }
+end
+
+-- depth: a query parameter that must be a whole number. Returns the integer
+-- or nil; RANGE is the caller's business, which is why a negative passes here
+-- and is refused by the handler that knows what it means.
+function int_param(v)
+  local n = tonumber(v)
+  if not n or n ~= math.floor(n) then return nil end
+  return math.floor(n)
+end
+
+-- depth: the edge's observation of the caller. x-real-ip first: the edge SETS
+-- it from the connection it terminated, so it has exactly one writer we own.
+-- The x-forwarded-for FIRST element is the fallback for paths without that
+-- edge (local runs, the in-process path) -- informational there, because an
+-- appended chain can be seeded by the caller.
+--
+-- Which is why a RATE LIMITER must not call this. A limiter keyed on a header
+-- the caller can seed is a limiter the caller configures; those call sites
+-- read req.real_ip only, on purpose, and this fallback is not to be tidied
+-- into them. The same goes for any answer that becomes durable state: it
+-- takes the set header or a single-element chain, never a seeded one.
+function observed_address(req)
+  if req.real_ip and req.real_ip ~= '' then return req.real_ip end
+  return req.forwarded and req.forwarded:match('^%s*([^,%s]+)') or nil
+end
+
+-- depth: the PORT the edge observed the caller from. x-real-port ONLY, and no
+-- x-forwarded-for-style fallback: no such convention exists for ports, and a
+-- guessed port is worse than none -- the consumer is a NAT diagnostic
+-- comparing mappings, and a wrong number there is a wrong conclusion. Same
+-- one-writer construction as x-real-ip.
+function observed_port(req)
+  local p = tonumber(req.real_port or '')
+  if p and p >= 1 and p <= 65535 and p % 1 == 0 then return p end
+  return nil
+end
+
+-- depth: the public half of the relay chain. The raw x-forwarded-for names
+-- every hop, and the inner ones map the deployment's own topology -- its
+-- private legs and gateway addresses -- for anyone curious; a production
+-- deployment echoed an internal address to the world until this function
+-- existed. Private, CGNAT, loopback and link-local entries are dropped from
+-- the public echo, and an empty result is nil rather than an empty string.
+-- The raw chain stays available to the owner through the debug config field,
+-- where debugging the path is the point.
+function public_forwarded(chain)
+  if type(chain) ~= 'string' then return nil end
+  local kept = {}
+  for entry in chain:gmatch('[^,]+') do
+    local e = entry:match('^%s*(.-)%s*$')
+    if e ~= '' then
+      local a, b = e:match('^(%d+)%.(%d+)%.')
+      a, b = tonumber(a), tonumber(b)
+      local internal =
+           (a == 10) or (a == 127)
+        or (a == 192 and b == 168)
+        or (a == 172 and b ~= nil and b >= 16 and b <= 31)
+        or (a == 100 and b ~= nil and b >= 64 and b <= 127)
+        or (a == 169 and b == 254)
+      if not internal then
+        local low = e:lower()
+        internal = low == '::1' or low:match('^f[cd]') ~= nil
+          or low:match('^fe[89ab]') ~= nil
+      end
+      if not internal then kept[#kept + 1] = e end
+    end
+  end
+  if #kept == 0 then return nil end
+  return table.concat(kept, ', ')
+end
+
+return M

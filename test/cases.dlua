@@ -1,0 +1,247 @@
+-- Cases for http_api. M is defined by the runner, which wraps the module in
+-- an IIFE and concatenates this file after it.
+
+local fails = 0
+local function ok(c, m) if c then print("   ok   " .. m) else print("   FAIL " .. m); fails = fails + 1 end end
+
+-- A recording queue and a recording encoder, which is the whole reason the
+-- push and the json table are injected instead of reached for.
+local function harness()
+  local h = { q = {}, encoded = nil, encodes = 0 }
+  h.api = M.new({
+    out_queue = h.q,
+    push = function (q, msg) q[#q + 1] = msg end,
+    json = { encode = function (t) h.encodes = h.encodes + 1; h.encoded = t; return '<encoded>' end },
+  })
+  h.last = function () return h.q[#h.q] end
+  return h
+end
+
+-- ---------------------------------------------------------- split_query
+
+local p, q = M.split_query('/v1/fetchpoints')
+ok(p == '/v1/fetchpoints', 'split_query: path with no query string')
+ok(type(q) == 'table' and next(q) == nil, 'split_query: query is always a table, empty here')
+
+p, q = M.split_query('/v1/events?limit=50&before=9')
+ok(p == '/v1/events', 'split_query: path stops at the question mark')
+ok(q.limit == '50' and q.before == '9', 'split_query: two pairs, values are text')
+
+p, q = M.split_query('/v1/x?')
+ok(p == '/v1/x' and next(q) == nil, 'split_query: a bare ? is an empty query')
+
+p, q = M.split_query('/s?q=a%20b')
+ok(q.q == 'a b', 'split_query: percent-decodes %20, the shape we care about')
+
+p, q = M.split_query('/s?q=a+b')
+ok(q.q == 'a b', 'split_query: + decodes to space')
+
+p, q = M.split_query('/s?q=%41%42')
+ok(q.q == 'AB', 'split_query: percent-decoding is by hex pair')
+
+p, q = M.split_query('/s?flag')
+ok(q.flag == '', 'split_query: a key with no = is present and empty, not nil')
+
+p, q = M.split_query('/s?=orphan&a=1')
+ok(q[''] == nil and q.a == '1', 'split_query: an empty key is dropped, the rest survives')
+
+p, q = M.split_query('/s?a=1&a=2')
+ok(q.a == '2', 'split_query: a repeated key keeps the last value')
+
+p, q = M.split_query('/s?a=b?c')
+ok(p == '/s' and q.a == 'b?c', 'split_query: only the FIRST ? splits; the rest is query text')
+
+-- ------------------------------------------------------------ int_param
+
+ok(M.int_param('50') == 50, 'int_param: a whole number parses')
+ok(M.int_param('5.5') == nil, 'int_param: a fraction is refused')
+ok(M.int_param('abc') == nil, 'int_param: text is refused')
+ok(M.int_param(nil) == nil, 'int_param: nil is refused, not an error')
+ok(M.int_param('') == nil, 'int_param: empty is refused')
+ok(M.int_param('-3') == -3, 'int_param: range is the caller job, so -3 parses')
+ok(M.int_param(7) == 7, 'int_param: an already-numeric value passes through')
+ok(M.int_param('0x10') == 16, 'int_param: carried over -- tonumber accepts hex, so 0x10 is 16')
+
+-- ----------------------------------------------------- observed_address
+
+ok(M.observed_address({ real_ip = '203.0.113.7', forwarded = '198.51.100.1' })
+   == '203.0.113.7', 'observed_address: x-real-ip wins, it is the writer we own')
+ok(M.observed_address({ real_ip = '', forwarded = '198.51.100.1' })
+   == '198.51.100.1', 'observed_address: an empty real_ip falls through to the chain')
+ok(M.observed_address({ forwarded = '  198.51.100.1 , 10.0.0.2' })
+   == '198.51.100.1', 'observed_address: the FIRST chain element, whitespace trimmed')
+ok(M.observed_address({}) == nil, 'observed_address: no observation is nil')
+ok(M.observed_address({ forwarded = '' }) == nil, 'observed_address: an empty chain is nil')
+
+-- -------------------------------------------------------- observed_port
+
+ok(M.observed_port({ real_port = '41234' }) == 41234, 'observed_port: a port parses to a number')
+ok(M.observed_port({ real_port = '1' }) == 1, 'observed_port: 1 is in range')
+ok(M.observed_port({ real_port = '65535' }) == 65535, 'observed_port: 65535 is in range')
+ok(M.observed_port({ real_port = '0' }) == nil, 'observed_port: 0 is out of range')
+ok(M.observed_port({ real_port = '65536' }) == nil, 'observed_port: 65536 is out of range')
+ok(M.observed_port({ real_port = '443.5' }) == nil, 'observed_port: a fractional port is refused')
+ok(M.observed_port({ real_port = 'abc' }) == nil, 'observed_port: text is refused')
+ok(M.observed_port({}) == nil, 'observed_port: absent is nil -- no chain fallback exists for ports')
+ok(M.observed_port({ forwarded = '198.51.100.1' }) == nil,
+   'observed_port: the forwarded chain is NOT a port fallback')
+
+-- ----------------------------------------------------- public_forwarded
+
+ok(M.public_forwarded(nil) == nil, 'public_forwarded: a non-string is nil')
+ok(M.public_forwarded(42) == nil, 'public_forwarded: a number is nil, not an error')
+ok(M.public_forwarded('10.0.0.5') == nil,
+   'public_forwarded: an all-internal chain is NIL, not an empty string')
+ok(M.public_forwarded('198.51.100.1, 10.0.0.5') == '198.51.100.1',
+   'public_forwarded: the leak that prompted this -- the private leg is dropped')
+ok(M.public_forwarded('198.51.100.1, 10.0.0.5, 203.0.113.9') == '198.51.100.1, 203.0.113.9',
+   'public_forwarded: an internal hop in the MIDDLE is dropped, the rest joins with ", "')
+ok(M.public_forwarded('  198.51.100.1  ,  203.0.113.9  ') == '198.51.100.1, 203.0.113.9',
+   'public_forwarded: entries are trimmed')
+ok(M.public_forwarded('127.0.0.1') == nil, 'public_forwarded: loopback is internal')
+ok(M.public_forwarded('192.168.1.4') == nil, 'public_forwarded: 192.168/16 is internal')
+ok(M.public_forwarded('169.254.10.1') == nil, 'public_forwarded: link-local is internal')
+ok(M.public_forwarded('172.16.0.1') == nil, 'public_forwarded: 172.16 is the low end of the /12')
+ok(M.public_forwarded('172.31.255.1') == nil, 'public_forwarded: 172.31 is the high end of the /12')
+ok(M.public_forwarded('172.15.0.1') == '172.15.0.1', 'public_forwarded: 172.15 is public')
+ok(M.public_forwarded('172.32.0.1') == '172.32.0.1', 'public_forwarded: 172.32 is public')
+ok(M.public_forwarded('100.64.0.1') == nil, 'public_forwarded: 100.64 is the low end of CGNAT')
+ok(M.public_forwarded('100.127.0.1') == nil, 'public_forwarded: 100.127 is the high end of CGNAT')
+ok(M.public_forwarded('100.63.0.1') == '100.63.0.1', 'public_forwarded: 100.63 is public')
+ok(M.public_forwarded('100.128.0.1') == '100.128.0.1', 'public_forwarded: 100.128 is public')
+ok(M.public_forwarded('::1') == nil, 'public_forwarded: v6 loopback is internal')
+ok(M.public_forwarded('fc00::1') == nil, 'public_forwarded: fc00::/7 is internal')
+ok(M.public_forwarded('fd12:3456::1') == nil, 'public_forwarded: fd.. unique-local is internal')
+ok(M.public_forwarded('fe80::1') == nil, 'public_forwarded: fe80 link-local is internal')
+ok(M.public_forwarded('FE80::1') == nil, 'public_forwarded: the v6 test is case-insensitive')
+ok(M.public_forwarded('2001:db8::1') == '2001:db8::1', 'public_forwarded: a public v6 is kept')
+ok(M.public_forwarded('::ffff:10.0.0.1') == '::ffff:10.0.0.1',
+   'public_forwarded: carried over -- a v4-mapped v6 private address is NOT classified')
+
+-- -------------------------------------------------------- request_from
+
+local r = M.request_from({ method = 'GET', path = '/v1/events?limit=2', body = 'B',
+  headers = { authorization = 'Bearer dfp_live_x', ['x-df-sub'] = 'auth0|1',
+              ['act-as'] = 'acct_2', host = 'API.Discofetch.LINK:8080',
+              ['x-real-ip'] = '203.0.113.7', ['x-forwarded-for'] = '203.0.113.7, 10.0.0.5',
+              ['x-real-port'] = '41234', ['x-edge'] = 'gate1' } })
+ok(r.method == 'GET', 'request_from: method is copied')
+ok(r.path == '/v1/events' and r.query.limit == '2', 'request_from: path and query are split here')
+ok(r.target == '/v1/events?limit=2',
+   'request_from: the UNPARSED target survives, for the rendezvous that forwards it verbatim')
+ok(r.body == 'B', 'request_from: body is copied')
+ok(r.host == 'api.discofetch.link',
+   'request_from: Host is lowercased and stripped of its port, once, here')
+ok(r.authorization == 'Bearer dfp_live_x', 'request_from: authorization is read')
+ok(r.sub == 'auth0|1', 'request_from: x-df-sub is the gateway-asserted session')
+ok(r.act_as == 'acct_2', 'request_from: act-as is read')
+ok(r.real_ip == '203.0.113.7', 'request_from: x-real-ip is read')
+ok(r.forwarded == '203.0.113.7, 10.0.0.5', 'request_from: the raw chain is kept whole')
+ok(r.real_port == '41234',
+   'request_from: real_port stays TEXT here -- observed_port is what publishes a number')
+ok(r.edge == 'gate1', 'request_from: x-edge says which vantage answered')
+ok(M.observed_port(r) == 41234, 'request_from + observed_port: the pair works end to end')
+
+local r2 = M.request_from({ method = 'GET', path = '/health' })
+ok(r2.host == '', 'request_from: no headers at all gives host "" rather than nil')
+ok(r2.real_ip == nil and r2.sub == nil and r2.authorization == nil,
+   'request_from: absent headers are nil, and reading them is not an error')
+ok(r2.path == '/health' and next(r2.query) == nil, 'request_from: a path with no query')
+
+local r3 = M.request_from({ method = 'GET', headers = { host = 'label.discofetch.link' } })
+ok(r3.path == '/' and r3.target == nil,
+   'request_from: a missing target parses as / but target stays nil')
+ok(r3.host == 'label.discofetch.link', 'request_from: a host with no port is unchanged')
+
+-- --------------------------------------------------------------- new()
+
+local bad
+bad = select(2, pcall(M.new, { push = function () end, json = { encode = function () end } }))
+ok(tostring(bad):find('out_queue', 1, true) ~= nil,
+   'new: a missing out_queue fails AT new, naming the dep')
+bad = select(2, pcall(M.new, { out_queue = {}, json = { encode = function () end } }))
+ok(tostring(bad):find('push', 1, true) ~= nil, 'new: a missing push fails at new, naming the dep')
+bad = select(2, pcall(M.new, { out_queue = {}, push = function () end }))
+ok(tostring(bad):find('json', 1, true) ~= nil, 'new: a missing json fails at new, naming the dep')
+bad = select(2, pcall(M.new, { out_queue = {}, push = function () end, json = {} }))
+ok(tostring(bad):find('encode', 1, true) ~= nil,
+   'new: a json table without encode fails at new, naming what is wrong')
+bad = select(2, pcall(M.new, { out_queue = {}, push = 'queue.push', json = { encode = function () end } }))
+ok(tostring(bad):find('push', 1, true) ~= nil, 'new: a wrong-TYPED push fails at new too')
+
+-- --------------------------------------------------------------- reply
+
+local h = harness()
+h.api:reply('c1', 200, { ok = true })
+local m = h.last()
+ok(m.conn == 'c1' and m.status == 200, 'reply: conn and status are echoed onto the message')
+ok(h.encodes == 1 and h.encoded.ok == true, 'reply: a table payload is encoded')
+ok(m.body == '<encoded>', 'reply: the encoded body rides as body')
+ok(m.content_type == 'application/json', 'reply: the default content type is json')
+ok(m.headers == nil, 'reply: no headers means the field is absent, not an empty table')
+
+h = harness()
+h.api:reply('c2', 200, '[]')
+m = h.last()
+ok(m.body == '[]', 'reply: a STRING payload passes through verbatim')
+ok(h.encodes == 0,
+   'reply: the encoder is not called for a string -- json.encode cannot express an empty ARRAY')
+
+h = harness()
+h.api:reply('c3', 200, 'ok\n', nil, 'text/plain')
+m = h.last()
+ok(m.content_type == 'text/plain',
+   'reply: content_type is a FIELD a caller overrides -- the allowlist refuses it by name')
+ok(m.body == 'ok\n' and h.encodes == 0, 'reply: reflect text mode is bytes, not json')
+
+h = harness()
+h.api:reply('c4', 200, { a = 1 }, { ['cache-control'] = 'no-store' })
+m = h.last()
+ok(m.headers ~= nil and m.headers['cache-control'] == 'no-store',
+   'reply: headers are passed through untouched -- the HOST drops off-allowlist names, silently')
+
+-- ---------------------------------------------------------------- fail
+
+h = harness()
+h.api:fail('c5', 404, 'no_route', 'no route for GET /nope')
+m = h.last()
+ok(m.status == 404, 'fail: the status is the caller idea of the refusal')
+ok(h.encoded.error ~= nil, 'fail: the body is the one error envelope')
+ok(h.encoded.error.code == 'no_route', 'fail: code is for a program')
+ok(h.encoded.error.message == 'no route for GET /nope', 'fail: message is for a person')
+ok(m.content_type == 'application/json', 'fail: a refusal is json like everything else')
+ok(m.headers == nil, 'fail: no headers unless the caller passes some')
+
+h = harness()
+h.api:fail('c6', 401, 'unauthenticated', 'no verified identity on this request', M.AUTH_CHALLENGE)
+m = h.last()
+ok(m.headers == M.AUTH_CHALLENGE, 'fail: the challenge rides as headers on a 401')
+ok(M.AUTH_CHALLENGE['www-authenticate'] == 'Bearer realm="discofetch"',
+   'AUTH_CHALLENGE: the frozen value, under a lowercase allowlisted name')
+
+h = harness()
+h.api:fail('c7', 429, 'rate_limited', 'retry in 7s', { ['retry-after'] = '7' })
+m = h.last()
+ok(m.headers['retry-after'] == '7',
+   'fail: retry-after rides here, and must be on the response_headers allowlist in BOTH host files')
+
+-- ------------------------------------------------------------- no_body
+
+h = harness()
+h.api:no_body('c8', 204)
+m = h.last()
+ok(m.status == 204 and m.conn == 'c8', 'no_body: status and conn are echoed')
+ok(m.body == '', 'no_body: the body is empty text -- encoding a nil would send the bytes "null"')
+ok(m.content_type == nil, 'no_body: a 204 carries no content type')
+ok(m.headers == nil, 'no_body: a 204 carries no headers')
+ok(h.encodes == 0, 'no_body: nothing is encoded')
+
+-- --------------------------------------------------- two instances live
+
+local h1, h2 = harness(), harness()
+h1.api:reply('a', 200, 'one')
+h2.api:reply('b', 500, 'two')
+ok(#h1.q == 1 and #h2.q == 1, 'two instances: each writes only its own queue')
+ok(h1.q[1].body == 'one' and h2.q[1].body == 'two', 'two instances: no shared module state')
+
+print(fails == 0 and "PASS" or ("FAIL " .. fails))
