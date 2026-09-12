@@ -132,6 +132,21 @@ pinning the current answer:
   surrounding whitespace is tolerated. Callers range-check but do not
   re-validate the spelling.
 - `observed_port` has the same `tonumber` reach: `0x1bb` is accepted as 443.
+  **Audited against the live deployment and found unreachable**: the only
+  writer is `proxy_set_header X-Real-Port $remote_port` at the edge
+  (`deploy/gates/edge/fetchpoints.conf:165`), `proxy_set_header` *replaces*
+  rather than appends, and the API's `location /` sets all four edge headers,
+  so a caller cannot inject one past it. The hex reach is a latent sharp edge,
+  not a live one — it would only bite a deployment whose edge writes a
+  non-decimal port, and none does.
+- **The trust `observed_address` places in `x-real-ip` was audited too, and it
+  holds.** The same `proxy_set_header` replacement covers it, and the `x-df-`
+  identity namespace — the thing that actually confers authority — is stripped
+  by prefix, not by name: `http-request del-header x-df- -m beg` on both
+  HAProxy frontends (`deploy/dart1/haproxy/haproxy.cfg:93` and `:258`). The
+  edge additionally blanks two names by hand, which is belt-and-braces rather
+  than the control. So `api/supervisor.lua`'s claim that the strip "is the
+  entire reason it can be trusted" is accurate as written.
 - ~~`public_forwarded` does not classify a v4-mapped v6 address~~ — **fixed,
   and fixed in `api/supervisor.lua` at the same time.** This was a real leak of
   the same kind the function exists to prevent: the v4 test reads the HEAD of
