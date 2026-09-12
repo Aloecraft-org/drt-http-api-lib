@@ -123,8 +123,8 @@ ok(M.public_forwarded('fd12:3456::1') == nil, 'public_forwarded: fd.. unique-loc
 ok(M.public_forwarded('fe80::1') == nil, 'public_forwarded: fe80 link-local is internal')
 ok(M.public_forwarded('FE80::1') == nil, 'public_forwarded: the v6 test is case-insensitive')
 ok(M.public_forwarded('2001:db8::1') == '2001:db8::1', 'public_forwarded: a public v6 is kept')
-ok(M.public_forwarded('::ffff:10.0.0.1') == '::ffff:10.0.0.1',
-   'public_forwarded: carried over -- a v4-mapped v6 private address is NOT classified')
+-- (This case used to pin the OPPOSITE assertion, documenting the carried-over
+-- bug. The leak is fixed; the v4-mapped block further down is now the pin.)
 
 -- -------------------------------------------------------- request_from
 
@@ -254,5 +254,44 @@ h1.api:reply('a', 200, 'one')
 h2.api:reply('b', 500, 'two')
 ok(#h1.q == 1 and #h2.q == 1, 'two instances: each writes only its own queue')
 ok(h1.q[1].body == 'one' and h2.q[1].body == 'two', 'two instances: no shared module state')
+
+-- ------------------------------- public_forwarded: v4-mapped v6 must not leak
+--
+-- The octet test reads the HEAD of an address, and a v4-mapped v6 carries its
+-- v4 in the TAIL, so every one of these walked straight through the filter
+-- until the classify-target was split from the echo-target. A dual-stack proxy
+-- writing `::ffff:10.0.0.1` into x-forwarded-for is the realistic way this
+-- happens, which is why it is the first case here rather than a curiosity.
+ok(M.public_forwarded('::ffff:10.0.0.1') == nil,
+   'v4-mapped: ::ffff:10.0.0.1 is private and must not be echoed')
+ok(M.public_forwarded('::ffff:192.168.1.1') == nil,
+   'v4-mapped: ::ffff:192.168.1.1 is private')
+ok(M.public_forwarded('::ffff:127.0.0.1') == nil,
+   'v4-mapped: loopback through the mapped spelling')
+ok(M.public_forwarded('::FFFF:10.0.0.1') == nil,
+   'v4-mapped: the case of the ffff literal does not matter')
+ok(M.public_forwarded('0:0:0:0:0:ffff:10.0.0.1') == nil,
+   'v4-mapped: the fully expanded spelling is the same address')
+ok(M.public_forwarded('::ffff:172.16.0.1') == nil,
+   'v4-mapped: the 172/12 range, whose bounds the head test also checks')
+ok(M.public_forwarded('::ffff:100.64.0.1') == nil,
+   'v4-mapped: CGNAT')
+ok(M.public_forwarded('::10.0.0.1') == nil,
+   'v4-compatible: the deprecated ::a.b.c.d spelling leaks the same address')
+ok(M.public_forwarded('[::ffff:10.0.0.1]') == nil,
+   'brackets: a literal in brackets is still the address inside them')
+ok(M.public_forwarded('[::1]:8080') == nil,
+   'brackets: a port does not turn loopback into a public hop')
+
+-- ...and the other half of the rule: a PUBLIC address written in the mapped
+-- form is still public, and is echoed in the spelling it arrived in. Filtering
+-- more than we should would be the same bug pointed the other way.
+ok(M.public_forwarded('::ffff:203.0.113.9') == '::ffff:203.0.113.9',
+   'v4-mapped: a public address survives, in its original spelling')
+ok(M.public_forwarded('[2001:db8::1]:443') == '[2001:db8::1]:443',
+   'brackets: a public v6 literal survives untouched')
+ok(M.public_forwarded('203.0.113.9, ::ffff:10.0.0.1, 198.51.100.7')
+     == '203.0.113.9, 198.51.100.7',
+   'v4-mapped: one private mapped hop is dropped from the middle of a chain')
 
 print(fails == 0 and "PASS" or ("FAIL " .. fails))

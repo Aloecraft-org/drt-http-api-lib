@@ -132,10 +132,15 @@ pinning the current answer:
   surrounding whitespace is tolerated. Callers range-check but do not
   re-validate the spelling.
 - `observed_port` has the same `tonumber` reach: `0x1bb` is accepted as 443.
-- `public_forwarded` does not classify a v4-mapped v6 address, so
-  `::ffff:10.0.0.1` is echoed as public. The v4 test needs a leading
-  `<digits>.<digits>.` and the v6 test looks only at `::1`, `fc`/`fd` and
-  `fe8`-`feb`.
+- ~~`public_forwarded` does not classify a v4-mapped v6 address~~ — **fixed,
+  and fixed in `api/supervisor.lua` at the same time.** This was a real leak of
+  the same kind the function exists to prevent: the v4 test reads the HEAD of
+  an address and a v4-mapped v6 carries its v4 in the TAIL, so `::ffff:10.0.0.1`
+  was echoed as public. The fix splits the address we *classify* from the one
+  we *echo* — brackets come off, a mapped tail is taken when there is one, the
+  original spelling is what gets kept. Verified against the pre-fix function
+  over 34 chains: 13 newly filtered, 0 newly exposed, so the change is
+  monotonic — it can only ever filter more.
 - `public_forwarded`'s `b ~= nil` guards in the 172/12 and CGNAT branches are
   unreachable-as-written: the v4 match binds both captures or neither.
   Harmless, and removing them is a rewrite of a branch nobody asked to change.

@@ -261,7 +261,22 @@ function public_forwarded(chain)
   for entry in chain:gmatch('[^,]+') do
     local e = entry:match('^%s*(.-)%s*$')
     if e ~= '' then
-      local a, b = e:match('^(%d+)%.(%d+)%.')
+      -- What to CLASSIFY, which is not always what we echo. A v4-mapped v6
+      -- address carries its v4 address in the TAIL -- `::ffff:10.0.0.1`, plus
+      -- the expanded `0:0:0:0:0:ffff:10.0.0.1` and upper-case spellings --
+      -- where the octet test below cannot see it, so a dual-stack proxy
+      -- writing that form walked a private address straight through this
+      -- filter. That is the exact leak this function exists to stop, wearing
+      -- a different spelling. Brackets come off for the same reason, and a
+      -- non-greedy match so `[::1]:8080` loses its port too.
+      --
+      -- What gets KEPT is still `e`, the original spelling: we decide on the
+      -- address, we echo what actually arrived.
+      local bare   = e:match('^%[(.-)%]') or e
+      local mapped = bare:match('^[0:]*:[fF][fF][fF][fF]:(%d+%.%d+%.%d+%.%d+)$')
+                  or bare:match('^::(%d+%.%d+%.%d+%.%d+)$')
+      local test   = mapped or bare
+      local a, b = test:match('^(%d+)%.(%d+)%.')
       a, b = tonumber(a), tonumber(b)
       local internal =
            (a == 10) or (a == 127)
@@ -270,7 +285,7 @@ function public_forwarded(chain)
         or (a == 100 and b ~= nil and b >= 64 and b <= 127)
         or (a == 169 and b == 254)
       if not internal then
-        local low = e:lower()
+        local low = test:lower()
         internal = low == '::1' or low:match('^f[cd]') ~= nil
           or low:match('^fe[89ab]') ~= nil
       end
