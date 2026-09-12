@@ -36,6 +36,10 @@ ok(q.q == 'a b', 'split_query: percent-decodes %20, the shape we care about')
 p, q = M.split_query('/s?q=a+b')
 ok(q.q == 'a b', 'split_query: + decodes to space')
 
+p, q = M.split_query('/s?q=a%2Bb')
+ok(q.q == 'a+b',
+   'split_query: %2B is a literal +, so + decodes to space BEFORE percent-decoding')
+
 p, q = M.split_query('/s?q=%41%42')
 ok(q.q == 'AB', 'split_query: percent-decoding is by hex pair')
 
@@ -83,8 +87,12 @@ ok(M.observed_port({ real_port = '65536' }) == nil, 'observed_port: 65536 is out
 ok(M.observed_port({ real_port = '443.5' }) == nil, 'observed_port: a fractional port is refused')
 ok(M.observed_port({ real_port = 'abc' }) == nil, 'observed_port: text is refused')
 ok(M.observed_port({}) == nil, 'observed_port: absent is nil -- no chain fallback exists for ports')
-ok(M.observed_port({ forwarded = '198.51.100.1' }) == nil,
-   'observed_port: the forwarded chain is NOT a port fallback')
+-- The chain here must be something that WOULD parse as a number, or the case
+-- cannot fail: '198.51.100.1' returns nil whether or not a fallback exists.
+ok(M.observed_port({ forwarded = '8080' }) == nil,
+   'observed_port: a NUMERIC forwarded chain is still not a port fallback')
+ok(M.observed_port({ real_port = '', forwarded = '8080' }) == nil,
+   'observed_port: an empty real_port does not fall through to the chain either')
 
 -- ----------------------------------------------------- public_forwarded
 
@@ -168,6 +176,9 @@ ok(tostring(bad):find('encode', 1, true) ~= nil,
    'new: a json table without encode fails at new, naming what is wrong')
 bad = select(2, pcall(M.new, { out_queue = {}, push = 'queue.push', json = { encode = function () end } }))
 ok(tostring(bad):find('push', 1, true) ~= nil, 'new: a wrong-TYPED push fails at new too')
+bad = select(2, pcall(M.new))
+ok(tostring(bad):find('out_queue', 1, true) ~= nil,
+   'new: no deps table AT ALL is still a named failure, not an index-of-nil')
 
 -- --------------------------------------------------------------- reply
 

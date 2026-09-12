@@ -158,7 +158,7 @@ what `test/run.sh` does.
 
     sh test/run.sh          # DRT=/path/to/drt to point at another binary
 
-Green means the last line is exactly `PASS`. 108 cases: the query split and its
+Green means the last line is exactly `PASS`. 110 cases: the query split and its
 decoding, the integer parser's refusals, both observation functions including
 the absent-is-nil rules, every branch of the private/CGNAT/loopback/link-local
 classification, the request table's absent-vs-nil and host-normalisation
@@ -166,3 +166,14 @@ behaviour, each named `new()` refusal, and the envelope -- string passthrough
 with the encoder proven uncalled, the default and overridden content type,
 header passthrough, the error envelope, the 204 shape, and two instances
 writing only their own queues.
+
+Two of those cases exist because the obvious spelling of them proves nothing,
+and both are the kind that rot silently:
+
+- **The decoder's ORDER is pinned, not just its output.** `+` becomes a space
+  BEFORE `%xx` is expanded, so `%2B` survives as a literal `+`. Cases built
+  only from `a+b` and `a%20b` pass under either order; the case that discriminates
+  is `q=a%2Bb -> a+b`.
+- **The "no port fallback" case uses a chain that would parse as a number.**
+  `observed_port({ forwarded = '198.51.100.1' })` is nil whether or not a
+  fallback exists, so it cannot fail; `forwarded = '8080'` can.
